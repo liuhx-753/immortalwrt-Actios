@@ -173,6 +173,25 @@ jobs:
         # 删除 small-package 中与系统冲突的包，避免编译报错（官方推荐操作）
         rm -rf openwrt/feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
 
+        # ==== 同名包去重：统一由 feeds/packages 提供，避免 kconfig 递归依赖 ====
+        # smpackage/tailscale(1.80.3) 与 packages/tailscale(1.104.4) 同为 PKG_NAME:=tailscale
+        # smpackage/openwrt-natmap 与 packages/natmap 功能重复
+        rm -rf openwrt/feeds/smpackage/tailscale openwrt/feeds/smpackage/openwrt-natmap
+        # smpackage/luci-app-natmap 目录内嵌同名的 natmap(20240813)，
+        # 且 luci-app-natmap 本身与 feeds/luci 的版本重名，整目录删除
+        rm -rf openwrt/feeds/smpackage/luci-app-natmap
+
+        # ==== 文件冲突：luci-app-tailscale 自带 init/config，与 tailscale 主包重叠 ====
+        # 只删这两个文件，保留 htdocs/po，LuCI 界面不受影响
+        rm -f openwrt/feeds/smpackage/luci-app-tailscale/root/etc/init.d/tailscale
+        rm -f openwrt/feeds/smpackage/luci-app-tailscale/root/etc/config/tailscale
+
+        # ==== 自检：列出剩余的重名包，便于后续排查 ====
+        find openwrt/feeds -maxdepth 4 -name Makefile 2>/dev/null | while read -r f; do
+          n=$(grep -m1 -oP '^PKG_NAME:=\K\S+' "$f" 2>/dev/null)
+          [ -n "$n" ] && echo "$n $f"
+        done | sort | awk '{c[$1]++; p[$1]=p[$1]" "$2} END {for (k in c) if (c[k]>1) print "::warning::包名重复: "k" ->"p[k]}'
+
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a -f
 
@@ -245,8 +264,34 @@ jobs:
     - name: Config defconfig
       id: config
       run: |
-       cd openwrt
-       make defconfig
+        set -o pipefail
+        cd openwrt
+        make defconfig 2>&1 | tee defconfig.log
+
+    - name: 校验关键包已启用 (Verify config)
+      run: |
+        cd openwrt
+        has() { grep -qE "^CONFIG_PACKAGE_$1=[ym]" .config && echo 1 || echo 0; }
+        fail=0
+        check_dep() {
+          app="$1"; dep="$2"
+          a=$(has "$app"); d=$(has "$dep")
+          if [ "$a" = "1" ] && [ "$d" = "0" ]; then
+            echo "::error::${app} 已启用，但依赖 ${dep} 未启用（可能被 kconfig 递归依赖丢弃）"
+            fail=1
+          elif [ "$a" = "1" ]; then
+            echo "OK    ${app} + ${dep}"
+          else
+            echo "SKIP  ${app} 未启用"
+          fi
+        }
+        check_dep luci-app-natmap natmap
+        check_dep luci-app-tailscale tailscale
+        if grep -q "recursive dependency detected" defconfig.log; then
+          echo "::warning::defconfig 存在递归依赖，请检查同名包定义"
+          grep -B 2 "recursive dependency detected" defconfig.log | head -40 || true
+        fi
+        exit $fail
        
     - name: Download package
       id: package
